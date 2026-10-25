@@ -27,7 +27,8 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { chooseWord, decideBid } from "./strategy.js";
+import { chooseWord, decideBid, type Participant } from "./strategy.js";
+import { Trackers } from "./trackers.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -63,13 +64,16 @@ const DICTIONARY: string[] = fs.existsSync(dictionaryPath)
       .map((l) => l.trim().toUpperCase())
       .filter((l) => l.length >= 2)
   : [];
-DICTIONARY.sort((a, b) => b.length - a.length); // longest first for greedy pick
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
 const bidsByAuction = new Set<string>();
 const lastWordAttemptByMatch = new Map<string, number>();
 const WORD_RETRY_MS = 500;
+
+// Reconstructs the remaining bag + opponent racks per match from public
+// tables — see trackers.ts. Keyed by matchId, dropped when a match ends.
+const trackers = new Trackers();
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
   if (!myIdentity) return null;
@@ -89,17 +93,33 @@ function rackForMatch(
   return rack;
 }
 
+// Every bot's live balance/score in a match — match_participant is a fully
+// public table, so this isn't limited to our own bot.
+function participantsForMatch(
+  conn: DbConnection,
+  matchId: bigint,
+): Participant[] {
+  const participants: Participant[] = [];
+  for (const p of conn.db.matchParticipant.iter()) {
+    if (p.matchId !== matchId) continue;
+    participants.push({
+      botId: p.botId,
+      balance: Number(p.balance),
+      score: Number(p.score),
+    });
+  }
+  return participants;
+}
+
 function participantForMatch(
   conn: DbConnection,
   matchId: bigint,
 ): { balance: number; score: number } | null {
   if (myBotId === null) return null;
-  for (const p of conn.db.matchParticipant.iter()) {
-    if (p.matchId !== matchId) continue;
-    if (p.botId !== myBotId) continue;
-    return { balance: Number(p.balance), score: Number(p.score) };
-  }
-  return null;
+  const mine = participantsForMatch(conn, matchId).find(
+    (p) => p.botId === myBotId,
+  );
+  return mine ?? null;
 }
 
 // A reducer call fails when the module refuses it, often for an expected
@@ -124,10 +144,19 @@ function tryBid(
   if (bidsByAuction.has(key)) return;
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
+  const match = conn.db.matchState.id.find(matchId);
+  if (!match) return;
+  const tracker = trackers.forMatch(matchId);
+  tracker.noteOwnStartingRack(rackForMatch(conn, matchId));
   const amount = decideBid({
     letter,
     myBalance: participant.balance,
     myRack: rackForMatch(conn, matchId),
+    dictionary: DICTIONARY,
+    remainingBag: tracker.remainingBag(),
+    bagTotal: match.bagTotal,
+    auctionType: match.auctionType.tag,
+    participants: participantsForMatch(conn, matchId),
   });
   if (amount <= 0) return;
   conn.reducers
@@ -154,9 +183,15 @@ function tryPlayWord(conn: DbConnection) {
     const key = String(matchId);
     if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
     lastWordAttemptByMatch.set(key, now);
+    const match = conn.db.matchState.id.find(matchId);
+    if (!match) continue;
+    const participant = participantForMatch(conn, matchId);
+    if (!participant) continue;
     const word = chooseWord({
       myRack: rackForMatch(conn, matchId),
       dictionary: DICTIONARY,
+      myBalance: participant.balance,
+      bagTotal: match.bagTotal,
     });
     if (!word) continue;
     console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
@@ -217,6 +252,10 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     .subscribeToAllTables();
 
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
+    // Every auction reveals its letter the instant it opens, win or not —
+    // feed the bag-reconstruction tracker for this match regardless of
+    // whether we end up bidding on it.
+    trackers.forMatch(a.matchId).noteAuctionOpened(a.letter);
     if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
   });
   conn.db.myRack.onInsert(() => tryPlayWord(conn));
@@ -225,6 +264,9 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     if (myBotId === null) myBotId = resolveMyBotId(conn);
   });
   conn.db.auctionResult.onInsert((_ctx, r) => {
+    if (r.winnerBotId !== undefined && r.winnerBotId !== null) {
+      trackers.forMatch(r.matchId).noteAuctionWon(r.winnerBotId, r.letter);
+    }
     if (myBotId === null) return;
     const winner =
       r.winnerBotId !== undefined && r.winnerBotId !== null
@@ -234,18 +276,26 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid}`,
     );
   });
+  // Every bot's word plays are public — fold them in too, so opponent
+  // racks (not just the bag) stay reconstructed.
+  conn.db.wordPlay.onInsert((_ctx, w) => {
+    trackers.forMatch(w.matchId).noteWordPlayed(w.botId, w.word);
+  });
 
   // When a match this bot was in ends, hop back into the lobby.
   conn.db.matchState.onUpdate((_ctx, old, neu) => {
+    if (old.status.tag === "Ended" || neu.status.tag !== "Ended") return;
+    // Drop its tracker regardless of whether we were in it — a no-op if we
+    // never had one, and otherwise avoids leaking state over a
+    // long-running process.
+    trackers.drop(neu.id);
     if (myBotId === null) return;
-    if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
-      const wasIn = Array.from(conn.db.matchParticipant.iter()).some(
-        (p) => p.matchId === neu.id && p.botId === myBotId,
-      );
-      if (wasIn) {
-        console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
-        joinLobby(conn);
-      }
+    const wasIn = Array.from(conn.db.matchParticipant.iter()).some(
+      (p) => p.matchId === neu.id && p.botId === myBotId,
+    );
+    if (wasIn) {
+      console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
+      joinLobby(conn);
     }
   });
 }
@@ -282,7 +332,12 @@ function bootstrapActivity(conn: DbConnection) {
   }
   joinLobby(conn);
   for (const a of conn.db.auction.iter()) {
-    if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
+    if (a.status.tag !== "Open") continue;
+    // A match already under way when we (re)connect: the tracker starts
+    // fresh here, so its bag estimate won't reflect rounds before we
+    // joined — acceptable for a bot that stays connected between matches.
+    trackers.forMatch(a.matchId).noteAuctionOpened(a.letter);
+    tryBid(conn, a.id, a.matchId, a.letter);
   }
   tryPlayWord(conn);
 }
