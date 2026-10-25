@@ -50,6 +50,19 @@ test("chooseWord plays immediately once balance is low", () => {
   assert.equal(word, "CAT");
 });
 
+test("chooseWord plays a word below the hold-length once it clears the reward floor", () => {
+  // ZESTY: Z10+E1+S1+T1+Y4=17, x2 (5 letters) = 34 — well past REWARD_FLOOR,
+  // but only 5 letters, below HOLD_UNTIL_LEN.
+  const dictionary = ["ZESTY", "CAT", "AT"];
+  const word = chooseWord({
+    myRack: rack("ZESTY"),
+    dictionary,
+    myBalance: 100,
+    bagTotal: 50,
+  });
+  assert.equal(word, "ZESTY");
+});
+
 test("chooseWord holds a short, unbonused word when there's no urgency", () => {
   const dictionary = ["TACT", "CAT", "AT"];
   const word = chooseWord({
@@ -95,26 +108,26 @@ const participants: Participant[] = [
 ];
 
 test("decideBid bids more for a letter that completes a better word now", () => {
-  // CARS (C3+A1+R1+S1=6, x1.5 = 9) is a concrete, large payoff for "C".
-  const dictionary = ["CARS", "CAT", "AT"];
-  const withC = decideBid({
-    letter: "C",
+  // ARTISAN (A1+R1+T1+I1+S1+A1+N1=7, x3 for 7 letters = 21) is a large,
+  // concrete payoff for "N" — big enough to clear the balance-scaled
+  // baseline premium (~11-15 at balance 100) that every letter gets, so
+  // the test actually measures the completion signal, not noise.
+  const dictionary = ["ARTISAN", "CAT", "AT"];
+  const withN = decideBid({
+    letter: "N",
     myBalance: 100,
-    myRack: rack("ARS"),
+    myRack: rack("ARTISA"),
     dictionary,
     remainingBag: fullBag(),
     bagTotal: 50,
     auctionType: "Vickrey",
     participants,
   });
-  // "Y" (2 in the bag, not the last copy) doesn't complete anything here —
-  // only scarcity/optionality apply. (Deliberately not a singleton letter
-  // like Z/Q/J/X: those are correctly bid near full value on their one
-  // and only appearance regardless, which isn't what this test checks.)
+  // "Y" doesn't complete anything here — only the baseline premium applies.
   const withY = decideBid({
     letter: "Y",
     myBalance: 100,
-    myRack: rack("ARS"),
+    myRack: rack("ARTISA"),
     dictionary,
     remainingBag: fullBag(),
     bagTotal: 50,
@@ -122,8 +135,8 @@ test("decideBid bids more for a letter that completes a better word now", () => 
     participants,
   });
   assert.ok(
-    withC > withY,
-    `expected a completion bid (${withC}) to beat a speculative one (${withY})`,
+    withN > withY,
+    `expected a completion bid (${withN}) to beat a speculative one (${withY})`,
   );
 });
 

@@ -29,6 +29,16 @@ import { bestWord, bestWordWith } from "./wordfinder.js";
 
 const ORIGINAL_COUNT = new Map<string, number>(DEFAULT_BAG);
 
+// Real English letter frequency (% of letters in typical text). Used to
+// weight bidding toward letters that actually combine into words — see
+// decideBid's premiumRate.
+const LETTER_FREQUENCY: Record<string, number> = {
+  E: 12.7, T: 9.1, A: 8.2, O: 7.5, I: 7.0, N: 6.7, S: 6.3, H: 6.1, R: 6.0,
+  D: 4.3, L: 4.0, C: 2.8, U: 2.8, M: 2.4, W: 2.4, F: 2.2, G: 2.0, Y: 2.0,
+  P: 1.9, B: 1.5, V: 1.0, K: 0.8, J: 0.15, X: 0.15, Q: 0.1, Z: 0.07,
+};
+const MAX_LETTER_FREQUENCY = 12.7; // E
+
 // ---------- Tunable constants ----------
 
 // Below this many tiles left in the bag, stop speculating: only bid on
@@ -52,10 +62,21 @@ export const AGGRESSION = 1.0;
 export const LOW_BALANCE_FRACTION = 0.2;
 
 // Outside the endgame, hold out for a word at least this long before
-// cashing in (unless a low-balance or endgame trigger fires). 7 is the
-// top reward tier (3x multiplier) — past that, length keeps adding base
-// score but the multiplier itself can't improve further.
+// cashing in (unless another trigger below fires). 7 is the top reward
+// tier (3x multiplier) — past that, length keeps adding base score but
+// the multiplier itself can't improve further.
 export const HOLD_UNTIL_LEN = 7;
+
+// Also cash in immediately once the best playable word is worth at least
+// this much, regardless of length. Across 17 real matches, our avg reward
+// per word played (26.1) and avg word length (6.2) already matched or beat
+// live opponents (26.8, 5.5) — the entire score gap was that they played
+// ~2.9 words/match to our ~1.6, including lots of cheap 2-letter throwaway
+// plays. bestWord only ever spends the tiles it needs for *that* word, so
+// cashing in something small doesn't cost the rest of the rack its shot at
+// a bigger word later — holding a low-value find instead of playing it is
+// close to pure downside once that's accounted for.
+export const REWARD_FLOOR = 6;
 
 // ---------- Context passed in from index.ts ----------
 
@@ -116,10 +137,24 @@ export function decideBid(ctx: BidContext): number {
   // (vowels especially) to any opponent who pays a premium for them —
   // and since currency has no other use, losing the vowel economy entirely
   // is worse than occasionally paying a bit over face value for one.
-  // Vowels get the biggest premium: cheapest to win and needed in nearly
-  // every word. Taper off once we're already holding a couple.
-  const isVowel = "AEIOU".includes(ctx.letter);
-  const genericPremium = isVowel ? 6 : 4;
+  //
+  // The premium scales with *current balance* rather than a flat number:
+  // observed live opponents paid 14-16 for 1-point letters (balance ~100),
+  // well above any flat-point-value formula — balance sitting unspent is
+  // worthless, so a competitive bot has to be willing to spend a real
+  // fraction of it per auction, not a fixed few points. Scaling with
+  // balance also self-tapers as it depletes, instead of needing a
+  // separate hand-tuned pacing cap to avoid overspending late.
+  // Rate scales with real English letter frequency (LETTER_FREQUENCY,
+  // below), not just a vowel/consonant split — a flat split treats S, T,
+  // N, R, L (extremely common in real words) the same as J, V, X (rare),
+  // which turned out to matter live: winning the same *number* of
+  // auctions as an opponent in one match produced less than half their
+  // score, because we weren't selective about which letters to chase.
+  // Taper off once we're already holding a couple.
+  const frequency = LETTER_FREQUENCY[ctx.letter] ?? 1;
+  const premiumRate = 0.06 + (frequency / MAX_LETTER_FREQUENCY) * 0.12;
+  const genericPremium = ctx.myBalance * premiumRate;
   const optionalityFloor = have < 2 ? value + genericPremium : value * 0.3;
 
   const speculative = Math.min(
@@ -155,10 +190,11 @@ export function chooseWord(ctx: WordContext): string | null {
   const endgame = ctx.bagTotal <= ENDGAME_BAG_THRESHOLD;
   const lowBalance = ctx.myBalance < 100 * LOW_BALANCE_FRACTION;
   const reachedTopTier = best.word.length >= HOLD_UNTIL_LEN;
+  const goodEnough = best.reward >= REWARD_FLOOR;
 
-  if (endgame || lowBalance || reachedTopTier) return best.word;
+  if (endgame || lowBalance || reachedTopTier || goodEnough) return best.word;
 
-  // Comfortable balance, rounds still left, and nothing great on the rack
+  // Comfortable balance, rounds still left, and nothing good on the rack
   // yet — hold and re-evaluate on the next rack change rather than cash
   // in a small, unbonused word early.
   return null;
