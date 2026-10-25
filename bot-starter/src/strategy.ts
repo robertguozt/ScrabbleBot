@@ -67,16 +67,26 @@ export const LOW_BALANCE_FRACTION = 0.2;
 // the multiplier itself can't improve further.
 export const HOLD_UNTIL_LEN = 7;
 
-// Also cash in immediately once the best playable word is worth at least
-// this much, regardless of length. Across 17 real matches, our avg reward
-// per word played (26.1) and avg word length (6.2) already matched or beat
-// live opponents (26.8, 5.5) — the entire score gap was that they played
-// ~2.9 words/match to our ~1.6, including lots of cheap 2-letter throwaway
-// plays. bestWord only ever spends the tiles it needs for *that* word, so
-// cashing in something small doesn't cost the rest of the rack its shot at
-// a bigger word later — holding a low-value find instead of playing it is
-// close to pure downside once that's accounted for.
-export const REWARD_FLOOR = 6;
+// Also cash in immediately once the best playable word clears a reward
+// floor — but the floor itself depends on how many rack tiles would be
+// left over unused after playing it:
+//   - few left over (<= SMALL_LEFTOVER_TILES): there's little being
+//     "protected" by holding, so almost anything is worth cashing in now
+//     (REWARD_FLOOR_SMALL_RACK).
+//   - many left over: real unused potential remains, so hold out for
+//     something more substantial (REWARD_FLOOR_BIG_RACK).
+// Across 17 real matches, our avg reward/word (26.1) and word length (6.2)
+// already matched or beat live opponents (26.8, 5.5) — the gap was that
+// they played ~2.9 words/match to our ~1.6. A single flat floor turned out
+// too coarse: low enough to catch that gap also meant dumping several
+// small words in a row from a still-large rack when a bit more patience
+// would have combined them into one bigger word instead (observed live:
+// one match played JO/HIT/AVA/ENOL — four tiny finds — for 27 points
+// combined). Tying the floor to the leftover-tile count targets the
+// actual idle-rack problem without being trigger-happy on a fresh rack.
+export const REWARD_FLOOR_SMALL_RACK = 5;
+export const REWARD_FLOOR_BIG_RACK = 15;
+export const SMALL_LEFTOVER_TILES = 2;
 
 // ---------- Context passed in from index.ts ----------
 
@@ -190,7 +200,15 @@ export function chooseWord(ctx: WordContext): string | null {
   const endgame = ctx.bagTotal <= ENDGAME_BAG_THRESHOLD;
   const lowBalance = ctx.myBalance < 100 * LOW_BALANCE_FRACTION;
   const reachedTopTier = best.word.length >= HOLD_UNTIL_LEN;
-  const goodEnough = best.reward >= REWARD_FLOOR;
+
+  let rackTiles = 0;
+  for (const count of ctx.myRack.values()) rackTiles += count;
+  const leftoverTiles = rackTiles - best.word.length;
+  const rewardFloor =
+    leftoverTiles <= SMALL_LEFTOVER_TILES
+      ? REWARD_FLOOR_SMALL_RACK
+      : REWARD_FLOOR_BIG_RACK;
+  const goodEnough = best.reward >= rewardFloor;
 
   if (endgame || lowBalance || reachedTopTier || goodEnough) return best.word;
 

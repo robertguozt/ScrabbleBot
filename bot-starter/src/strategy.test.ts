@@ -51,8 +51,9 @@ test("chooseWord plays immediately once balance is low", () => {
 });
 
 test("chooseWord plays a word below the hold-length once it clears the reward floor", () => {
-  // ZESTY: Z10+E1+S1+T1+Y4=17, x2 (5 letters) = 34 — well past REWARD_FLOOR,
-  // but only 5 letters, below HOLD_UNTIL_LEN.
+  // ZESTY: Z10+E1+S1+T1+Y4=17, x2 (5 letters) = 34 — well past either
+  // reward floor, but only 5 letters, below HOLD_UNTIL_LEN. Uses the
+  // whole rack (0 leftover tiles), so the small-rack floor applies too.
   const dictionary = ["ZESTY", "CAT", "AT"];
   const word = chooseWord({
     myRack: rack("ZESTY"),
@@ -63,10 +64,27 @@ test("chooseWord plays a word below the hold-length once it clears the reward fl
   assert.equal(word, "ZESTY");
 });
 
-test("chooseWord holds a short, unbonused word when there's no urgency", () => {
+test("chooseWord plays even a modest word once few tiles would be left idle", () => {
   const dictionary = ["TACT", "CAT", "AT"];
   const word = chooseWord({
-    myRack: rack("CATX"), // best playable is CAT, length 3: no multiplier
+    // Best playable is CAT (reward 5), leaving only "X" (1 tile) idle —
+    // at or below SMALL_LEFTOVER_TILES, so the low small-rack floor
+    // applies and 5 clears it.
+    myRack: rack("CATX"),
+    dictionary,
+    myBalance: 100,
+    bagTotal: 50,
+  });
+  assert.equal(word, "CAT");
+});
+
+test("chooseWord holds a modest word when a large, mostly-idle rack suggests more is coming", () => {
+  const dictionary = ["TACT", "CAT", "AT"];
+  const word = chooseWord({
+    // Best playable is still just CAT (reward 5), but it leaves 4 tiles
+    // (X, Y, Z, W) idle — above SMALL_LEFTOVER_TILES, so the higher
+    // big-rack floor applies and 5 doesn't clear it.
+    myRack: rack("CATXYZW"),
     dictionary,
     myBalance: 100,
     bagTotal: 50,
